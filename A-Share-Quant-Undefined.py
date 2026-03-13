@@ -39,7 +39,7 @@ def send_telegram_message(text):
         print(f"    ⚠️ Telegram 请求异常: {e}")
 
 # ==========================================
-# 模块二：数据获取与机械初筛
+# 模块二：数据获取与机械初筛 (保留了优化后的逻辑)
 # ==========================================
 def fetch_and_mechanical_screen():
     print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] >>> 开始执行每周量化初筛...")
@@ -49,18 +49,27 @@ def fetch_and_mechanical_screen():
         print(f"数据获取失败: {e}")
         return pd.DataFrame()
 
+    # 1. 剔除ST、退市、北交所(8开头)及老代码
     df = df[~df['名称'].str.contains('ST|退')]
     df = df[~df['代码'].str.startswith(('8', '4'))]
 
-    df = df[(df['市盈率-动态'] > 0) & (df['市盈率-动态'] < 35)]
+    # 2. 估值与市值底线过滤 (剔除50亿以下微盘股，放宽PE上限)
+    df = df[df['总市值'] > 5000000000] 
+    df = df[(df['市盈率-动态'] > 0) & (df['市盈率-动态'] < 50)] 
+    
+    # 3. 盈利能力过滤
     df['近似ROE(%)'] = (df['市净率'] / df['市盈率-动态']) * 100
-    df = df[df['近似ROE(%)'] > 8.0]
+    df = df[df['近似ROE(%)'] > 6.0] 
 
-    df = df[(df['换手率'] > 2.0) & (df['换手率'] < 15.0)]
-    df = df[df['涨跌幅'] > 0]
+    # 4. 流动性与量价状态
+    df = df[(df['换手率'] > 1.5) & (df['换手率'] < 20.0)]
+    df = df[df['涨跌幅'] > -7.0] # 剔除单日暴跌，保留左侧缩量回调机会
 
-    df['综合得分'] = df['近似ROE(%)'].rank() + df['涨跌幅'].rank()
-    top_stocks = df.nlargest(3, '综合得分') # 演示取Top 3
+    # 5. 综合打分
+    df['综合得分'] = df['近似ROE(%)'].rank(ascending=False) 
+    
+    # 取 Top 3 演示
+    top_stocks = df.nsmallest(3, '综合得分') 
     
     print(f"    初筛完成！选出 {len(top_stocks)} 只候选股进入 AI 研判池。")
     return top_stocks
@@ -81,7 +90,7 @@ def get_recent_news(stock_code):
         return "新闻获取失败。"
 
 # ==========================================
-# 模块四：AI 深度研判
+# 模块四：AI 深度研判 (已恢复为 Gemini 调用)
 # ==========================================
 def ai_qualitative_analysis(stock_name, stock_code, pe, roe, pct_chg, turnover, news_text):
     print(f"    正在调用 Gemini 深度分析 [{stock_name}]...")
@@ -108,8 +117,8 @@ def ai_qualitative_analysis(stock_name, stock_code, pe, roe, pct_chg, turnover, 
 
 ### 第一步：基本面与财务排雷 (Financial Risk Check)
 分析 {financial_data}。如果存在以下任意情况，请直接触发一票否决：
-1. ROE持续低于8%或扣非净利润为负。
-2. 存在明显的财务造假风险（如应计利润异常、现金流与利润严重背离）。
+1. 存在明显的财务造假风险迹象。
+2. 新闻中存在严重的监管问询或负面黑天鹅。
 *请简述排雷结论。*
 
 ### 第二步：核心逻辑与主线契合度 (Moat & Theme Alignment)
@@ -117,7 +126,7 @@ def ai_qualitative_analysis(stock_name, stock_code, pe, roe, pct_chg, turnover, 
 *请给出深度定性分析。*
 
 ### 第三步：量价择时状态评估 (Quant/Timing Analysis)
-分析 {price_volume_status}。评估该股当前处于何种微观结构（如：均线多头/空头排列、缩量回调、放量突破、或动量崩溃边缘）。判断当前是否具备安全的买入赔率。
+分析 {price_volume_status}。结合基本面，判断当前是属于“右侧突破”、“左侧缩量回调”还是“估值修复”。判断当前是否具备安全的买入赔率。
 *请给出量价匹配度分析。*
 
 ### 第四步：最终决策与结构化输出 (Final Decision)
@@ -126,7 +135,7 @@ def ai_qualitative_analysis(stock_name, stock_code, pe, roe, pct_chg, turnover, 
 ## 输出格式要求
 请务必以严格的 Markdown 格式输出，不要包含多余的客套话：
 
-**【最终结论】**：[仅限填写：强烈推荐 / 逐步建仓 / 保留观察 / 建议剔除]
+**【最终结论】**：[仅限填写：强烈推荐 /逐步建仓 /保留观察 /建议剔除]
 **【核心驱动因子】**：[用3-5个词概括，如：海外毛利扩张、缩量回调、出海逻辑兑现]
 **【风险提示】**：[一句话指出最大风险点]
 **【决策理由（150字以内）】**：[精炼总结你的投资逻辑，必须包含基本面与量价的共振点]
@@ -170,5 +179,4 @@ def weekly_rebalance_job():
     send_telegram_message("✅ *本周调仓研判报告推送完毕！*")
 
 if __name__ == "__main__":
-    # GitHub Actions 触发时，直接运行一次任务即结束
     weekly_rebalance_job()
