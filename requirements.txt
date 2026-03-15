@@ -1,4 +1,7 @@
-akshare
+yfinance
 pandas
-google-generativeai
+numpy
 requests
+python-dateutil
+lxml
+html5lib
