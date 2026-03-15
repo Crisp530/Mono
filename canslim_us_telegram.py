@@ -1,15 +1,13 @@
-import math
-import os
-import time
-import requests
-import warnings
-from dataclasses import dataclass, asdict
+import json, math, os, time, warnings
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from io import StringIO
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+import requests
 import yfinance as yf
 
 try:
@@ -18,17 +16,20 @@ except ImportError:
     ZoneInfo = None
 
 warnings.filterwarnings("ignore")
-
-
-# =========================
-# CONFIG
-# =========================
+BASE_DIR = Path(__file__).resolve().parent
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "arcee-ai/trinity-large-preview:free")
+OPENROUTER_API_URL = os.getenv("OPENROUTER_API_URL", "https://openrouter.ai/api/v1/chat/completions")
+OPENROUTER_SITE_URL = os.getenv("OPENROUTER_SITE_URL")
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Monthly CANSLIM AI Screen")
+AI_ENABLED = os.getenv("AI_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+AI_REVIEW_MAX_STOCKS = int(os.getenv("AI_REVIEW_MAX_STOCKS", "12"))
+AI_TIMEOUT = int(os.getenv("AI_TIMEOUT", "60"))
+AI_TEMPERATURE = float(os.getenv("AI_TEMPERATURE", "0.2"))
+AI_MAX_OUTPUT_TOKENS = min(int(os.getenv("AI_MAX_OUTPUT_TOKENS", "2000")), 2000)
 MIN_PASS_COUNT = int(os.getenv("MIN_PASS_COUNT", "5"))
-
-# Formal CANSLIM-like thresholds
 MIN_Q_GROWTH = float(os.getenv("MIN_Q_GROWTH", "0.20"))
 MIN_3Y_CAGR = float(os.getenv("MIN_3Y_CAGR", "0.15"))
 NEAR_HIGH_RATIO = float(os.getenv("NEAR_HIGH_RATIO", "0.95"))
@@ -36,259 +37,174 @@ MIN_RS_PERCENTILE = float(os.getenv("MIN_RS_PERCENTILE", "80"))
 MIN_INST_OWNERSHIP = float(os.getenv("MIN_INST_OWNERSHIP", "0.35"))
 MIN_VOLUME_SURGE = float(os.getenv("MIN_VOLUME_SURGE", "1.30"))
 MIN_DOLLAR_VOLUME_20D = float(os.getenv("MIN_DOLLAR_VOLUME_20D", "20000000"))
-
-# Broad pre-screen thresholds
 PRE_NEAR_HIGH_RATIO = float(os.getenv("PRE_NEAR_HIGH_RATIO", "0.90"))
 PRE_MIN_RS_PERCENTILE = float(os.getenv("PRE_MIN_RS_PERCENTILE", "60"))
 PRE_MIN_DOLLAR_VOLUME_20D = float(os.getenv("PRE_MIN_DOLLAR_VOLUME_20D", "10000000"))
-
 BENCHMARK = os.getenv("BENCHMARK", "SPY")
 MARKET_ETFS = ["SPY", "QQQ"]
-
 REQUEST_PAUSE = float(os.getenv("REQUEST_PAUSE", "0.05"))
 MAX_MESSAGE_STOCKS = int(os.getenv("MAX_MESSAGE_STOCKS", "20"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
-
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
 SP500_FALLBACK_CSV_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
-
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-}
+HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en-US,en;q=0.9"}
 
 
-# =========================
-# HELPERS
-# =========================
-def require_env() -> None:
+def require_env():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID in environment variables.")
+        raise ValueError("Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
 
 
-def send_telegram_message(token: str, chat_id: str, text: str) -> None:
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
-    r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
+def tg(text: str, parse_mode: Optional[str] = "Markdown"):
+    body = {"chat_id": TELEGRAM_CHAT_ID, "text": text, "disable_web_page_preview": True}
+    if parse_mode:
+        body["parse_mode"] = parse_mode
+    r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage", json=body, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
 
-def safe_get(url: str, headers: Optional[dict] = None, timeout: int = HTTP_TIMEOUT) -> requests.Response:
-    merged_headers = dict(DEFAULT_HEADERS)
-    if headers:
-        merged_headers.update(headers)
-    resp = requests.get(url, headers=merged_headers, timeout=timeout)
-    resp.raise_for_status()
-    return resp
+def safe_get(url: str):
+    r = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    return r
 
 
-def normalize_tickers(tickers: List[str]) -> List[str]:
-    cleaned = []
-    for x in tickers:
-        s = str(x).strip().upper()
-        if not s:
-            continue
-        s = s.replace(".", "-")  # Yahoo format
-        cleaned.append(s)
-    return sorted(list(set(cleaned)))
+def norm_tickers(items: List[str]) -> List[str]:
+    return sorted({str(x).strip().upper().replace('.', '-') for x in items if str(x).strip()})
 
 
-def get_sp500_tickers_from_wikipedia() -> List[str]:
-    resp = safe_get(SP500_WIKI_URL)
-    tables = pd.read_html(StringIO(resp.text))
-    if not tables:
-        raise ValueError("Wikipedia returned no tables.")
+def sp500_wiki() -> List[str]:
+    tables = pd.read_html(StringIO(safe_get(SP500_WIKI_URL).text))
+    if not tables or "Symbol" not in tables[0].columns:
+        raise ValueError("Wikipedia table missing Symbol")
+    return norm_tickers(tables[0]["Symbol"].tolist())
 
-    df = tables[0]
+
+def sp500_csv() -> List[str]:
+    df = pd.read_csv(StringIO(safe_get(SP500_FALLBACK_CSV_URL).text))
     if "Symbol" not in df.columns:
-        raise ValueError("Wikipedia S&P 500 table missing 'Symbol' column.")
-
-    tickers = normalize_tickers(df["Symbol"].tolist())
-    if not tickers:
-        raise ValueError("Wikipedia returned empty ticker list.")
-    return tickers
+        raise ValueError("Fallback CSV missing Symbol")
+    return norm_tickers(df["Symbol"].tolist())
 
 
-def get_sp500_tickers_from_fallback_csv() -> List[str]:
-    resp = safe_get(SP500_FALLBACK_CSV_URL)
-    df = pd.read_csv(StringIO(resp.text))
-    if "Symbol" not in df.columns:
-        raise ValueError("Fallback CSV missing 'Symbol' column.")
+def get_sp500() -> Tuple[List[str], str]:
+    errs = []
+    for fn, name in ((sp500_wiki, "wikipedia"), (sp500_csv, "datahub_csv")):
+        try:
+            tickers = fn()
+            if tickers:
+                return tickers, name
+        except Exception as exc:
+            errs.append(f"{name} failed: {exc}")
+    raise RuntimeError("Unable to load S&P 500 tickers. " + " | ".join(errs))
 
-    tickers = normalize_tickers(df["Symbol"].tolist())
-    if not tickers:
-        raise ValueError("Fallback CSV returned empty ticker list.")
-    return tickers
 
-
-def get_sp500_tickers() -> Tuple[List[str], str]:
-    errors = []
-
+def sf(x: Any) -> Optional[float]:
     try:
-        tickers = get_sp500_tickers_from_wikipedia()
-        return tickers, "wikipedia"
-    except Exception as e:
-        errors.append(f"Wikipedia failed: {e}")
-
-    try:
-        tickers = get_sp500_tickers_from_fallback_csv()
-        return tickers, "datahub_csv"
-    except Exception as e:
-        errors.append(f"Fallback CSV failed: {e}")
-
-    raise RuntimeError("Unable to load S&P 500 tickers. " + " | ".join(errors))
-
-
-def safe_float(x) -> Optional[float]:
-    try:
-        if x is None:
-            return None
-        val = float(x)
-        if math.isnan(val):
-            return None
-        return val
+        v = float(x)
+        return None if math.isnan(v) else v
     except Exception:
         return None
 
 
 def pct_change(new: Optional[float], old: Optional[float]) -> Optional[float]:
-    if new is None or old is None or old == 0:
-        return None
-    return (new - old) / abs(old)
+    return None if new is None or old in (None, 0) else (new - old) / abs(old)
 
 
 def calc_cagr(values: List[float]) -> Optional[float]:
     vals = [v for v in values if v is not None and pd.notna(v)]
-    if len(vals) < 2:
+    if len(vals) < 2 or vals[0] <= 0 or vals[-1] <= 0:
         return None
-    first, last = vals[0], vals[-1]
-    n = len(vals) - 1
-    if first <= 0 or last <= 0 or n <= 0:
-        return None
-    return (last / first) ** (1 / n) - 1
+    return (vals[-1] / vals[0]) ** (1 / (len(vals) - 1)) - 1
 
 
-def compute_ma(series: pd.Series, window: int) -> Optional[float]:
-    if series is None or len(series.dropna()) < window:
-        return None
-    return float(series.rolling(window).mean().iloc[-1])
+def ma(series: pd.Series, window: int) -> Optional[float]:
+    return None if series is None or len(series.dropna()) < window else float(series.rolling(window).mean().iloc[-1])
 
 
-def get_history(symbol: str, period: str = "2y", interval: str = "1d", retries: int = 2) -> Optional[pd.DataFrame]:
+def hist(symbol: str, period: str = "1y", interval: str = "1d", retries: int = 2):
     last_error = None
     for _ in range(retries + 1):
         try:
-            df = yf.download(
-                symbol,
-                period=period,
-                interval=interval,
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-            )
+            df = yf.download(symbol, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
             if df is None or df.empty:
                 return None
-
             if isinstance(df.columns, pd.MultiIndex):
                 df.columns = df.columns.get_level_values(0)
-
             df = df.dropna(how="all")
-            if df.empty:
-                return None
-
-            return df
-        except Exception as e:
-            last_error = e
+            return None if df.empty else df
+        except Exception as exc:
+            last_error = exc
             time.sleep(0.5)
+    if last_error:
+        print(f"{symbol} history failed: {last_error}")
     return None
 
 
-def get_info(ticker: yf.Ticker) -> Dict:
+def ticker_info(t):
     try:
-        info = ticker.info
+        info = t.info
         return info if isinstance(info, dict) else {}
     except Exception:
         return {}
 
 
-def get_quarterly_net_income_or_eps(ticker: yf.Ticker) -> Tuple[Optional[float], Optional[float], str]:
-    # Try quarterly earnings
+def quarterly_values(t) -> Tuple[Optional[float], Optional[float], str]:
     try:
-        qearn = getattr(ticker, "quarterly_earnings", None)
-        if qearn is not None and not qearn.empty:
-            cols = [str(c).lower() for c in qearn.columns]
+        q = getattr(t, "quarterly_earnings", None)
+        if q is not None and not q.empty:
+            cols = [str(c).lower() for c in q.columns]
             if "earnings" in cols:
-                col = qearn.columns[cols.index("earnings")]
-                vals = [safe_float(v) for v in qearn[col].dropna().tolist()]
+                vals = [sf(v) for v in q[q.columns[cols.index("earnings")]].dropna().tolist()]
                 vals = [v for v in vals if v is not None]
                 if len(vals) >= 5:
                     return vals[-1], vals[-5], "quarterly_earnings"
     except Exception:
         pass
-
-    # Try quarterly income statement
     try:
-        q_is = ticker.quarterly_income_stmt
-        if q_is is not None and not q_is.empty:
-            idx_lower = [str(i).lower() for i in q_is.index]
-            for c in ["net income", "netincome", "normalized income"]:
-                if c in idx_lower:
-                    row_name = q_is.index[idx_lower.index(c)]
-                    row = q_is.loc[row_name]
-                    vals = [safe_float(v) for v in row.tolist()]
+        q = t.quarterly_income_stmt
+        if q is not None and not q.empty:
+            idx = [str(i).lower() for i in q.index]
+            for key in ["net income", "netincome", "normalized income"]:
+                if key in idx:
+                    vals = [sf(v) for v in q.loc[q.index[idx.index(key)]].tolist()]
                     vals = [v for v in vals if v is not None]
                     if len(vals) >= 5:
                         return vals[0], vals[4], "quarterly_net_income"
     except Exception:
         pass
-
     return None, None, "missing"
 
 
-def get_annual_eps_or_net_income_series(ticker: yf.Ticker) -> Tuple[List[float], str]:
-    # Try annual earnings
+def annual_values(t) -> Tuple[List[float], str]:
     try:
-        earnings = getattr(ticker, "earnings", None)
-        if earnings is not None and not earnings.empty:
-            cols = [str(c).lower() for c in earnings.columns]
+        e = getattr(t, "earnings", None)
+        if e is not None and not e.empty:
+            cols = [str(c).lower() for c in e.columns]
             if "earnings" in cols:
-                col = earnings.columns[cols.index("earnings")]
-                vals = [safe_float(v) for v in earnings[col].dropna().tolist()]
+                vals = [sf(v) for v in e[e.columns[cols.index("earnings")]].dropna().tolist()]
                 vals = [v for v in vals if v is not None]
                 if len(vals) >= 3:
                     return vals, "annual_earnings"
     except Exception:
         pass
-
-    # Try annual income statement
     try:
-        a_is = ticker.income_stmt
-        if a_is is not None and not a_is.empty:
-            idx_lower = [str(i).lower() for i in a_is.index]
-            for c in ["net income", "netincome", "normalized income"]:
-                if c in idx_lower:
-                    row_name = a_is.index[idx_lower.index(c)]
-                    row = a_is.loc[row_name]
-                    vals = [safe_float(v) for v in row.tolist()]
+        q = t.income_stmt
+        if q is not None and not q.empty:
+            idx = [str(i).lower() for i in q.index]
+            for key in ["net income", "netincome", "normalized income"]:
+                if key in idx:
+                    vals = [sf(v) for v in q.loc[q.index[idx.index(key)]].tolist()]
                     vals = [v for v in vals if v is not None]
                     if len(vals) >= 3:
                         return list(reversed(vals)), "annual_net_income"
     except Exception:
         pass
-
     return [], "missing"
 
 
 @dataclass
-class ScreenResult:
+class Result:
     symbol: str
     pass_count: int
     c_current_growth: Optional[bool]
@@ -311,266 +227,256 @@ class ScreenResult:
     notes: str = ""
 
 
-# =========================
-# MARKET TREND (M)
-# =========================
-def market_trend_is_bullish() -> Tuple[bool, str]:
-    notes = []
-    ok = True
-
+def market_filter() -> Tuple[bool, str]:
+    notes, ok = [], True
     for symbol in MARKET_ETFS:
-        hist = get_history(symbol, period="1y")
-        if hist is None or hist.empty:
+        df = hist(symbol, period="1y")
+        if df is None or df.empty:
             return False, f"{symbol}: no history"
-
-        close = hist["Close"].dropna()
+        close = df["Close"].dropna()
         if len(close) < 200:
             return False, f"{symbol}: insufficient history"
-
-        last = float(close.iloc[-1])
-        ma50 = compute_ma(close, 50)
-        ma200 = compute_ma(close, 200)
-
+        last, ma50, ma200 = float(close.iloc[-1]), ma(close, 50), ma(close, 200)
         if ma50 is None or ma200 is None:
             return False, f"{symbol}: moving averages unavailable"
-
-        cond = (last > ma50) and (ma50 > ma200) if symbol == "SPY" else (last > ma200)
+        cond = (last > ma50 and ma50 > ma200) if symbol == "SPY" else (last > ma200)
         notes.append(f"{symbol} last={last:.2f}, ma50={ma50:.2f}, ma200={ma200:.2f}, bull={cond}")
         ok = ok and cond
-
     return ok, " | ".join(notes)
 
 
-# =========================
-# RELATIVE STRENGTH
-# =========================
-def compute_relative_strength_percentiles(
-    tickers: List[str],
-    benchmark_symbol: str = BENCHMARK
-) -> Dict[str, Dict[str, float]]:
-    benchmark_hist = get_history(benchmark_symbol, period="1y")
-    benchmark_12m = None
-    if benchmark_hist is not None and len(benchmark_hist) > 230:
-        bclose = benchmark_hist["Close"].dropna()
-        benchmark_12m = float(bclose.iloc[-1] / bclose.iloc[0] - 1)
-
-    rets_6m = {}
-    rets_12m = {}
-
+def build_rs_map(tickers: List[str]) -> Dict[str, Dict[str, float]]:
+    bench = hist(BENCHMARK, period="1y")
+    bench_12m = None
+    if bench is not None and len(bench) > 230:
+        c = bench["Close"].dropna()
+        bench_12m = float(c.iloc[-1] / c.iloc[0] - 1)
+    r6, r12 = {}, {}
     for symbol in tickers:
-        hist = get_history(symbol, period="1y")
+        df = hist(symbol, period="1y")
         time.sleep(REQUEST_PAUSE)
-        if hist is None or hist.empty:
+        if df is None or df.empty:
             continue
-
-        close = hist["Close"].dropna()
+        close = df["Close"].dropna()
         if len(close) < 126:
             continue
-
         try:
-            rets_6m[symbol] = float(close.iloc[-1] / close.iloc[-126] - 1)
-            rets_12m[symbol] = float(close.iloc[-1] / close.iloc[0] - 1)
+            r6[symbol] = float(close.iloc[-1] / close.iloc[-126] - 1)
+            r12[symbol] = float(close.iloc[-1] / close.iloc[0] - 1)
         except Exception:
             continue
-
-    if not rets_6m:
+    if not r6:
         return {}
-
-    series_6m = pd.Series(rets_6m)
-    percentiles = series_6m.rank(pct=True) * 100
-
-    result = {}
-    for symbol in series_6m.index:
-        result[symbol] = {
-            "rs_percentile": float(percentiles.loc[symbol]),
-            "ret_12m": float(rets_12m.get(symbol, np.nan)),
-            "benchmark_12m": benchmark_12m if benchmark_12m is not None else np.nan,
-        }
-    return result
+    p = pd.Series(r6).rank(pct=True) * 100
+    return {s: {"rs_percentile": float(p.loc[s]), "ret_12m": float(r12.get(s, np.nan)), "benchmark_12m": bench_12m if bench_12m is not None else np.nan} for s in p.index}
 
 
-# =========================
-# PRE-SCREEN
-# =========================
-def pre_screen_by_price_and_volume(tickers: List[str], rs_map: Dict[str, Dict[str, float]]) -> List[str]:
-    candidates = []
-
+def pre_screen(tickers: List[str], rs_map: Dict[str, Dict[str, float]]) -> List[str]:
+    out = []
     for symbol in tickers:
-        hist = get_history(symbol, period="1y")
+        df = hist(symbol, period="1y")
         time.sleep(REQUEST_PAUSE)
-        if hist is None or hist.empty:
+        if df is None or df.empty:
             continue
-
-        close = hist["Close"].dropna()
-        volume = hist["Volume"].dropna()
-
+        close, volume = df["Close"].dropna(), df["Volume"].dropna()
         if len(close) < 200 or len(volume) < 20:
             continue
-
-        last_price = float(close.iloc[-1])
-        high_52w = float(close.max())
-        ma200 = compute_ma(close, 200)
-
-        dv20 = (hist["Close"] * hist["Volume"]).tail(20)
-        avg_dollar_volume_20d = float(dv20.mean()) if len(dv20) >= 20 else None
-
-        rs_percentile = safe_float(rs_map.get(symbol, {}).get("rs_percentile"))
-
-        cond_near_high = last_price >= PRE_NEAR_HIGH_RATIO * high_52w if high_52w else False
-        cond_trend = (ma200 is not None) and (last_price > ma200)
-        cond_liquidity = (avg_dollar_volume_20d is not None) and (avg_dollar_volume_20d >= PRE_MIN_DOLLAR_VOLUME_20D)
-        cond_rs = (rs_percentile is not None) and (rs_percentile >= PRE_MIN_RS_PERCENTILE)
-
-        score = sum([cond_near_high, cond_trend, cond_liquidity, cond_rs])
+        last, high, ma200 = float(close.iloc[-1]), float(close.max()), ma(close, 200)
+        dv20 = (df["Close"] * df["Volume"]).tail(20)
+        avg_dv = float(dv20.mean()) if len(dv20) >= 20 else None
+        rs = sf(rs_map.get(symbol, {}).get("rs_percentile"))
+        score = sum([
+            last >= PRE_NEAR_HIGH_RATIO * high if high else False,
+            (ma200 is not None) and (last > ma200),
+            (avg_dv is not None) and (avg_dv >= PRE_MIN_DOLLAR_VOLUME_20D),
+            (rs is not None) and (rs >= PRE_MIN_RS_PERCENTILE),
+        ])
         if score >= 3:
-            candidates.append(symbol)
+            out.append(symbol)
+    return out
 
-    return candidates
 
-
-# =========================
-# FULL SCREEN
-# =========================
-def screen_stock(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bool) -> ScreenResult:
-    notes = []
-    ticker = yf.Ticker(symbol)
-    info = get_info(ticker)
-
-    hist = get_history(symbol, period="1y")
-    if hist is None or hist.empty:
-        return ScreenResult(
-            symbol=symbol,
-            pass_count=0,
-            c_current_growth=None,
-            a_cagr_3y=None,
-            a_recent_positive=None,
-            n_near_high=None,
-            n_trend=None,
-            l_rs=None,
-            i_inst=None,
-            s_volume=None,
-            market_ok=market_ok,
-            notes="No price history",
-        )
-
-    close = hist["Close"].dropna()
-    volume = hist["Volume"].dropna()
-
-    last_price = float(close.iloc[-1])
-    high_52w = float(close.max())
-    ma50 = compute_ma(close, 50)
-    ma200 = compute_ma(close, 200)
-
+def screen(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bool) -> Result:
+    notes, t = [], yf.Ticker(symbol)
+    info = ticker_info(t)
+    df = hist(symbol, period="1y")
+    if df is None or df.empty:
+        return Result(symbol, 0, None, None, None, None, None, None, None, None, market_ok, notes="No price history")
+    close, volume = df["Close"].dropna(), df["Volume"].dropna()
+    last, high = float(close.iloc[-1]), float(close.max())
+    ma50, ma200 = ma(close, 50), ma(close, 200)
     avg_vol_50 = float(volume.tail(50).mean()) if len(volume) >= 50 else None
     latest_vol = float(volume.iloc[-1]) if len(volume) > 0 else None
-
-    dv20 = (hist["Close"] * hist["Volume"]).tail(20)
-    avg_dollar_volume_20d = float(dv20.mean()) if len(dv20) >= 20 else None
-
-    # C
-    latest_q, year_ago_q, c_field = get_quarterly_net_income_or_eps(ticker)
-    current_growth_value = pct_change(latest_q, year_ago_q)
-    c_current_growth = None if current_growth_value is None else (current_growth_value >= MIN_Q_GROWTH)
-    notes.append(f"C source={c_field}")
-
-    # A
-    annual_series, a_field = get_annual_eps_or_net_income_series(ticker)
-    cagr_3y_value = None
-    a_cagr_3y = None
-    a_recent_positive = None
-
-    if len(annual_series) >= 4:
-        cagr_3y_value = calc_cagr(annual_series[-4:])
-        a_cagr_3y = None if cagr_3y_value is None else (cagr_3y_value >= MIN_3Y_CAGR)
-    elif len(annual_series) >= 3:
-        cagr_3y_value = calc_cagr(annual_series)
-        a_cagr_3y = None if cagr_3y_value is None else (cagr_3y_value >= MIN_3Y_CAGR)
-
-    if len(annual_series) >= 3:
-        a_recent_positive = all(v > 0 for v in annual_series[-3:])
-
-    notes.append(f"A source={a_field}")
-
-    # N
-    n_near_high = (last_price >= NEAR_HIGH_RATIO * high_52w) if high_52w else None
-    n_trend = None if (ma50 is None or ma200 is None) else ((last_price > ma50) and (ma50 > ma200))
-
-    # L
-    rs_percentile = None
-    l_rs = None
-    if symbol in rs_map:
-        rs_percentile = safe_float(rs_map[symbol].get("rs_percentile"))
-        stock_12m = safe_float(rs_map[symbol].get("ret_12m"))
-        bench_12m = safe_float(rs_map[symbol].get("benchmark_12m"))
-        if rs_percentile is not None and stock_12m is not None and bench_12m is not None:
-            l_rs = (rs_percentile >= MIN_RS_PERCENTILE) and (stock_12m > bench_12m)
-
-    # I
-    inst = safe_float(info.get("heldPercentInstitutions"))
-    i_inst = None if inst is None else (inst >= MIN_INST_OWNERSHIP)
-
-    # S
-    volume_ratio = None
-    s_volume = None
+    dv20 = (df["Close"] * df["Volume"]).tail(20)
+    avg_dv = float(dv20.mean()) if len(dv20) >= 20 else None
+    latest_q, year_q, csrc = quarterly_values(t)
+    current_growth = pct_change(latest_q, year_q)
+    c_ok = None if current_growth is None else current_growth >= MIN_Q_GROWTH
+    notes.append(f"C source={csrc}")
+    annual, asrc = annual_values(t)
+    cagr_3y = calc_cagr(annual[-4:] if len(annual) >= 4 else annual)
+    a_ok = None if cagr_3y is None else cagr_3y >= MIN_3Y_CAGR
+    a_recent = all(v > 0 for v in annual[-3:]) if len(annual) >= 3 else None
+    notes.append(f"A source={asrc}")
+    n1 = (last >= NEAR_HIGH_RATIO * high) if high else None
+    n2 = None if (ma50 is None or ma200 is None) else (last > ma50 and ma50 > ma200)
+    rs = sf(rs_map.get(symbol, {}).get("rs_percentile")) if symbol in rs_map else None
+    s12 = sf(rs_map.get(symbol, {}).get("ret_12m")) if symbol in rs_map else None
+    b12 = sf(rs_map.get(symbol, {}).get("benchmark_12m")) if symbol in rs_map else None
+    l_ok = (rs is not None and s12 is not None and b12 is not None and rs >= MIN_RS_PERCENTILE and s12 > b12)
+    inst = sf(info.get("heldPercentInstitutions"))
+    i_ok = None if inst is None else inst >= MIN_INST_OWNERSHIP
+    vr, s_ok = None, None
     if latest_vol is not None and avg_vol_50 is not None and avg_vol_50 > 0:
-        volume_ratio = latest_vol / avg_vol_50
-        liquid_enough = (avg_dollar_volume_20d is not None) and (avg_dollar_volume_20d >= MIN_DOLLAR_VOLUME_20D)
-        s_volume = (volume_ratio >= MIN_VOLUME_SURGE) and liquid_enough
+        vr = latest_vol / avg_vol_50
+        liquid = (avg_dv is not None) and (avg_dv >= MIN_DOLLAR_VOLUME_20D)
+        s_ok = (vr >= MIN_VOLUME_SURGE) and liquid
+    checks = [c_ok, a_ok, a_recent, n1, n2, l_ok, i_ok, s_ok]
+    return Result(symbol, sum(1 for x in checks if x is True), c_ok, a_ok, a_recent, n1, n2, l_ok, i_ok, s_ok, market_ok, current_growth, cagr_3y, rs, inst, last, high, vr, avg_dv, "; ".join(notes))
 
-    checks = [
-        c_current_growth,
-        a_cagr_3y,
-        a_recent_positive,
-        n_near_high,
-        n_trend,
-        l_rs,
-        i_inst,
-        s_volume,
-    ]
-    pass_count = sum(1 for x in checks if x is True)
 
-    return ScreenResult(
-        symbol=symbol,
-        pass_count=pass_count,
-        c_current_growth=c_current_growth,
-        a_cagr_3y=a_cagr_3y,
-        a_recent_positive=a_recent_positive,
-        n_near_high=n_near_high,
-        n_trend=n_trend,
-        l_rs=l_rs,
-        i_inst=i_inst,
-        s_volume=s_volume,
-        market_ok=market_ok,
-        current_growth_value=current_growth_value,
-        cagr_3y_value=cagr_3y_value,
-        rs_percentile=rs_percentile,
-        inst_ownership=inst,
-        price=last_price,
-        high_52w=high_52w,
-        volume_ratio=volume_ratio,
-        avg_dollar_volume_20d=avg_dollar_volume_20d,
-        notes="; ".join(notes),
+def rv(x: Optional[float], n: int = 4):
+    return None if x is None or pd.isna(x) else round(float(x), n)
+
+
+def ai_payload(r: Result) -> Dict[str, Any]:
+    return {
+        "symbol": r.symbol,
+        "pass_count": r.pass_count,
+        "checks": {
+            "c_current_growth": r.c_current_growth, "a_cagr_3y": r.a_cagr_3y, "a_recent_positive": r.a_recent_positive,
+            "n_near_high": r.n_near_high, "n_trend": r.n_trend, "l_rs": r.l_rs, "i_inst": r.i_inst, "s_volume": r.s_volume,
+        },
+        "metrics": {
+            "current_growth_value": rv(r.current_growth_value), "cagr_3y_value": rv(r.cagr_3y_value), "rs_percentile": rv(r.rs_percentile, 2),
+            "inst_ownership": rv(r.inst_ownership), "price": rv(r.price, 2), "high_52w": rv(r.high_52w, 2),
+            "volume_ratio": rv(r.volume_ratio), "avg_dollar_volume_20d": rv(r.avg_dollar_volume_20d, 2),
+        },
+        "notes": r.notes,
+    }
+
+
+def parse_ai(raw: str, allowed_symbols: List[str]) -> Dict[str, Any]:
+    raw = raw.strip()
+    if raw.startswith("```"):
+        lines = raw.splitlines()[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        raw = "\n".join(lines).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("No JSON object found in AI response")
+    payload = json.loads(raw[start:end + 1])
+    allowed = set(allowed_symbols)
+    seen, reviews, top = set(), [], []
+    for item in payload.get("reviews", []):
+        symbol = str(item.get("symbol", "")).strip().upper()
+        if symbol not in allowed or symbol in seen:
+            continue
+        seen.add(symbol)
+        reviews.append({
+            "symbol": symbol,
+            "verdict": {"buy": "focus", "strong_buy": "focus", "hold": "watch", "skip": "pass"}.get(str(item.get("verdict", "")).strip().lower(), str(item.get("verdict", "watch")).strip().lower()),
+            "confidence": sf(item.get("confidence")),
+            "reason": str(item.get("reason", "")).strip(),
+            "risk": str(item.get("risk", "")).strip(),
+        })
+    for item in payload.get("top_picks", []):
+        symbol = str(item).strip().upper()
+        if symbol in allowed and symbol not in top:
+            top.append(symbol)
+    return {"summary": str(payload.get("summary", "")).strip(), "top_picks": top[:5], "reviews": reviews, "missing_symbols": [s for s in allowed_symbols if s not in seen]}
+
+
+def review(results: List[Result], market_note: str, run_label: str) -> Dict[str, Any]:
+    if not results:
+        return {"status": "no_results", "summary": "机械筛选本轮没有产出候选标的，因此跳过 AI 复核。", "top_picks": [], "reviews": [], "missing_symbols": []}
+    if not AI_ENABLED:
+        return {"status": "disabled", "summary": "AI_ENABLED=0，已跳过 AI 复核。", "top_picks": [], "reviews": [], "missing_symbols": []}
+    if not OPENROUTER_API_KEY:
+        return {"status": "missing_api_key", "summary": "缺少 OPENROUTER_API_KEY，已跳过 AI 复核。", "top_picks": [], "reviews": [], "missing_symbols": []}
+    shortlist = results[:AI_REVIEW_MAX_STOCKS]
+    allowed = [r.symbol for r in shortlist]
+    payload = {
+        "run_label": run_label,
+        "market_note": market_note,
+        "mechanical_rule_thresholds": {
+            "min_pass_count": MIN_PASS_COUNT, "min_q_growth": MIN_Q_GROWTH, "min_3y_cagr": MIN_3Y_CAGR,
+            "near_high_ratio": NEAR_HIGH_RATIO, "min_rs_percentile": MIN_RS_PERCENTILE,
+            "min_inst_ownership": MIN_INST_OWNERSHIP, "min_volume_surge": MIN_VOLUME_SURGE,
+            "min_dollar_volume_20d": MIN_DOLLAR_VOLUME_20D,
+        },
+        "stocks": [ai_payload(r) for r in shortlist],
+    }
+    prompt = (
+        "你是月度选股流程中的第二层 AI 复核助手。下面这些股票已经通过第一层机械 CANSLIM-like 筛选，"
+        "你不能推翻机械筛选结果，只能在机械筛选结果之上给出第二层主观判断。\n\n"
+        "你的任务：\n"
+        "1. 只能基于我提供的字段进行判断，不能补充任何外部信息。\n"
+        "2. 对每只股票给出一个 verdict，取值只能是 focus、watch、pass。\n"
+        "3. 更偏好增长更强、RS 更高、趋势更完整、更接近 52 周高点、机构持股更合理、量能确认更充分的标的。\n"
+        "4. 如果关键字段缺失、量价配合不完整、或者只是勉强通过机械阈值，要更谨慎。\n"
+        "5. 输出必须是严格 JSON，不要 Markdown，不要代码块，不要解释性前言。\n\n"
+        "输出格式：\n"
+        "{\n"
+        "  \"summary\": \"一句话总结本轮候选的整体质量\",\n"
+        "  \"top_picks\": [\"示例代码1\", \"示例代码2\"],\n"
+        "  \"reviews\": [\n"
+        "    {\n"
+        "      \"symbol\": \"输入中的股票代码\",\n"
+        "      \"verdict\": \"focus\",\n"
+        "      \"confidence\": 0.82,\n"
+        "      \"reason\": \"一句话说明给出该评级的核心原因\",\n"
+        "      \"risk\": \"一句话说明最主要的风险点\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "额外规则：\n"
+        "- top_picks 只能来自 verdict=focus 的股票。\n"
+        "- top_picks 最多 5 个。\n"
+        "- reviews 必须覆盖每一只输入股票。\n"
+        "- reviews 中的 symbol 必须严格来自输入数据，不能虚构。\n"
+        "- top_picks 中的股票代码必须严格来自输入数据，不能虚构。\n"
+        "- 如果没有任何股票达到 focus，则 top_picks 返回空数组 []。\n"
+        "- confidence 必须在 0 到 1 之间。\n"
+        "- summary、reason、risk 必须全部使用简体中文。\n"
+        "- 语气直接、专业、简洁，不要空话。\n\n"
+        f"输入数据如下：\n{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
+    headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+    if OPENROUTER_SITE_URL:
+        headers["HTTP-Referer"] = OPENROUTER_SITE_URL
+    if OPENROUTER_APP_NAME:
+        headers["X-Title"] = OPENROUTER_APP_NAME
+    body = {
+        "model": OPENROUTER_MODEL,
+        "messages": [
+            {"role": "system", "content": "你是一个严格的中文选股复核助手。只能使用提供的数据，且必须返回合法 JSON。"},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": AI_TEMPERATURE,
+        "max_tokens": AI_MAX_OUTPUT_TOKENS,
+    }
+    try:
+        r = requests.post(OPENROUTER_API_URL, headers=headers, json=body, timeout=AI_TIMEOUT)
+        r.raise_for_status()
+        raw = r.json()["choices"][0]["message"]["content"].strip()
+        out = parse_ai(raw, allowed)
+        out.update({"status": "ok", "model": OPENROUTER_MODEL, "raw": raw})
+        return out
+    except Exception as exc:
+        return {"status": "error", "summary": f"AI 复核失败：{exc}", "top_picks": [], "reviews": [], "missing_symbols": allowed, "raw": ""}
 
 
-# =========================
-# FORMATTERS
-# =========================
-def bool_icon(v: Optional[bool]) -> str:
-    if v is True:
-        return "✅"
-    if v is False:
-        return "❌"
-    return "➖"
+def bi(v):
+    return "Y" if v is True else ("N" if v is False else "-")
 
 
-def pct_fmt(v: Optional[float]) -> str:
-    if v is None or pd.isna(v):
-        return "N/A"
-    return f"{v * 100:.1f}%"
+def pf(v):
+    return "N/A" if v is None or pd.isna(v) else f"{v * 100:.1f}%"
 
 
-def money_fmt(v: Optional[float]) -> str:
+def mf(v):
     if v is None or pd.isna(v):
         return "N/A"
     if v >= 1_000_000_000:
@@ -580,139 +486,100 @@ def money_fmt(v: Optional[float]) -> str:
     return f"${v:,.0f}"
 
 
-def fmt_num(v: Optional[float], ndigits: int = 2) -> str:
-    if v is None or pd.isna(v):
-        return "N/A"
-    return f"{v:.{ndigits}f}"
+def nf(v, d=2):
+    return "N/A" if v is None or pd.isna(v) else f"{v:.{d}f}"
 
 
-def build_message(
-    results: List[ScreenResult],
-    market_note: str,
-    run_label: str,
-    universe_size: int,
-    candidate_size: int,
-    ticker_source: str,
-) -> str:
+def cf(v):
+    return "N/A" if v is None or pd.isna(v) else f"{v * 100:.0f}%"
+
+
+def build_message(results: List[Result], market_note: str, run_label: str, universe: int, candidates: int, source: str) -> str:
     if not results:
-        return (
-            f"*Modern CANSLIM Screen*\n\n"
-            f"Run time: `{run_label}`\n"
-            f"Universe: S&P 500 ({universe_size} tickers, source: {ticker_source})\n"
-            f"Pre-screen candidates: {candidate_size}\n"
-            f"Market trend: ✅\n"
-            f"{market_note}\n\n"
-            f"No stocks passed this run."
-        )
-
-    lines = [
-        "*Modern CANSLIM Screen*",
-        "",
-        f"Run time: `{run_label}`",
-        f"Universe: S&P 500 ({universe_size} tickers, source: {ticker_source})",
-        f"Pre-screen candidates: {candidate_size}",
-        "Market trend: ✅",
-        market_note,
-        "",
-        f"Passed (>= {MIN_PASS_COUNT} rules): *{len(results)}*",
-        "",
-    ]
-
+        return f"*Monthly CANSLIM Screen*\n\nRun time: `{run_label}`\nUniverse: S&P 500 ({universe} tickers, source: {source})\nPre-screen candidates: {candidates}\nMarket trend: YES\n{market_note}\n\nNo stocks passed this run."
+    lines = ["*Monthly CANSLIM Screen*", "", f"Run time: `{run_label}`", f"Universe: S&P 500 ({universe} tickers, source: {source})", f"Pre-screen candidates: {candidates}", "Market trend: YES", market_note, "", f"Passed (>= {MIN_PASS_COUNT} rules): *{len(results)}*", ""]
     for r in results[:MAX_MESSAGE_STOCKS]:
-        lines.extend([
+        lines += [
             f"*{r.symbol}* | score: *{r.pass_count}*",
-            f"C {bool_icon(r.c_current_growth)} {pct_fmt(r.current_growth_value)} | "
-            f"A1 {bool_icon(r.a_cagr_3y)} {pct_fmt(r.cagr_3y_value)} | "
-            f"A2 {bool_icon(r.a_recent_positive)}",
-            f"N1 {bool_icon(r.n_near_high)} price {fmt_num(r.price)} / 52wH {fmt_num(r.high_52w)} | "
-            f"N2 {bool_icon(r.n_trend)}",
-            f"L {bool_icon(r.l_rs)} RS {fmt_num(r.rs_percentile, 1)} | "
-            f"I {bool_icon(r.i_inst)} {pct_fmt(r.inst_ownership)} | "
-            f"S {bool_icon(r.s_volume)} vol ratio {fmt_num(r.volume_ratio)}",
-            f"20d $vol: {money_fmt(r.avg_dollar_volume_20d)}",
+            f"C {bi(r.c_current_growth)} {pf(r.current_growth_value)} | A1 {bi(r.a_cagr_3y)} {pf(r.cagr_3y_value)} | A2 {bi(r.a_recent_positive)}",
+            f"N1 {bi(r.n_near_high)} price {nf(r.price)} / 52wH {nf(r.high_52w)} | N2 {bi(r.n_trend)}",
+            f"L {bi(r.l_rs)} RS {nf(r.rs_percentile, 1)} | I {bi(r.i_inst)} {pf(r.inst_ownership)} | S {bi(r.s_volume)} vol ratio {nf(r.volume_ratio)}",
+            f"20d $vol: {mf(r.avg_dollar_volume_20d)}",
             "",
-        ])
-
+        ]
     return "\n".join(lines)[:3900]
 
 
-# =========================
-# MAIN
-# =========================
+def build_ai_message(data: Dict[str, Any], run_label: str) -> str:
+    if data.get("status") == "no_results":
+        return ""
+    lines = [f"AI 复核（OpenRouter / {OPENROUTER_MODEL}）", f"运行时间: {run_label}", f"状态: {data.get('status')}"]
+    if data.get("summary"):
+        lines += ["", f"总评: {data['summary']}"]
+    if data.get("top_picks"):
+        lines.append(f"优先关注: {', '.join(data['top_picks'])}")
+    if data.get("reviews"):
+        lines += ["", "个股复核:"]
+        order = {"focus": 0, "watch": 1, "pass": 2}
+        reviews = sorted(data["reviews"], key=lambda x: (order.get(x.get("verdict", "watch"), 9), -(x.get("confidence") or 0), x.get("symbol", "")))
+        for r in reviews[:AI_REVIEW_MAX_STOCKS]:
+            lines.append(f"- {r['symbol']} | {r['verdict'].title()} | 置信度 {cf(r.get('confidence'))}")
+            if r.get("reason"):
+                lines.append(f"  原因: {r['reason']}")
+            if r.get("risk"):
+                lines.append(f"  风险: {r['risk']}")
+    if data.get("missing_symbols"):
+        lines += ["", f"AI 返回中缺失的股票: {', '.join(data['missing_symbols'])}"]
+    return "\n".join(lines)[:3900]
+
+
+def save_outputs(results: List[Result], failed: List[Tuple[str, str]], ai_data: Dict[str, Any]):
+    pd.DataFrame([asdict(r) for r in results]).to_csv(BASE_DIR / "canslim_results.csv", index=False)
+    pd.DataFrame(failed, columns=["symbol", "error"]).to_csv(BASE_DIR / "canslim_failures.csv", index=False)
+    (BASE_DIR / "canslim_ai_review.json").write_text(json.dumps(ai_data, ensure_ascii=False, indent=2), encoding="utf-8")
+    pd.DataFrame(ai_data.get("reviews", [])).to_csv(BASE_DIR / "canslim_ai_reviews.csv", index=False)
+
+
 def main():
     require_env()
-
     now_utc = datetime.now(timezone.utc)
-    if ZoneInfo is not None:
-        now_bj = now_utc.astimezone(ZoneInfo("Asia/Shanghai"))
-        run_label = now_bj.strftime("%Y-%m-%d %H:%M:%S CST")
-    else:
-        run_label = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    print(f"Run time UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+    run_label = now_utc.strftime("%Y-%m-%d %H:%M:%S UTC") if ZoneInfo is None else now_utc.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S CST")
     print(f"Run label: {run_label}")
-
-    tickers, ticker_source = get_sp500_tickers()
-    print(f"Loaded {len(tickers)} S&P 500 tickers from {ticker_source}")
-
-    market_ok, market_note = market_trend_is_bullish()
-    print(f"Market trend ok: {market_ok}")
+    tickers, source = get_sp500()
+    market_ok, market_note = market_filter()
+    print(f"Loaded {len(tickers)} S&P 500 tickers from {source}")
     print(market_note)
-
     if not market_ok:
-        msg = (
-            f"*Modern CANSLIM Screen*\n\n"
-            f"Run time: `{run_label}`\n"
-            f"Universe: S&P 500 ({len(tickers)} tickers, source: {ticker_source})\n"
-            f"Market trend: ❌\n"
-            f"{market_note}\n\n"
-            f"No signals sent because market filter is not bullish."
-        )
+        msg = f"*Monthly CANSLIM Screen*\n\nRun time: `{run_label}`\nUniverse: S&P 500 ({len(tickers)} tickers, source: {source})\nMarket trend: NO\n{market_note}\n\nNo signals sent because market filter is not bullish."
         print(msg)
-        send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
-        pd.DataFrame(columns=["symbol"]).to_csv("canslim_results.csv", index=False)
-        pd.DataFrame(columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
+        tg(msg)
+        save_outputs([], [], {"status": "market_blocked", "summary": "Market filter is not bullish.", "top_picks": [], "reviews": [], "missing_symbols": []})
         return
-
-    print("Computing relative strength map...")
-    rs_map = compute_relative_strength_percentiles(tickers, BENCHMARK)
-
-    print("Running broad pre-screen...")
-    candidates = pre_screen_by_price_and_volume(tickers, rs_map)
+    print("Computing RS map...")
+    rs = build_rs_map(tickers)
+    print("Running pre-screen...")
+    candidates = pre_screen(tickers, rs)
     print(f"Pre-screen kept {len(candidates)} / {len(tickers)}")
-
-    results: List[ScreenResult] = []
-    failed: List[Tuple[str, str]] = []
-
+    results, failed = [], []
     for i, symbol in enumerate(candidates, 1):
         print(f"[{i}/{len(candidates)}] Screening {symbol}")
         try:
-            result = screen_stock(symbol, rs_map, market_ok)
-            if result.pass_count >= MIN_PASS_COUNT:
-                results.append(result)
-        except Exception as e:
-            failed.append((symbol, str(e)))
-            print(f"{symbol} failed: {e}")
+            r = screen(symbol, rs, market_ok)
+            if r.pass_count >= MIN_PASS_COUNT:
+                results.append(r)
+        except Exception as exc:
+            failed.append((symbol, str(exc)))
         time.sleep(REQUEST_PAUSE)
-
-    results.sort(
-        key=lambda x: (
-            x.pass_count,
-            x.rs_percentile if x.rs_percentile is not None else -1,
-            x.current_growth_value if x.current_growth_value is not None else -999,
-        ),
-        reverse=True,
-    )
-
-    msg = build_message(results, market_note, run_label, len(tickers), len(candidates), ticker_source)
+    results.sort(key=lambda x: (x.pass_count, x.rs_percentile if x.rs_percentile is not None else -1, x.current_growth_value if x.current_growth_value is not None else -999), reverse=True)
+    msg = build_message(results, market_note, run_label, len(tickers), len(candidates), source)
     print(msg)
-    send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
-
-    pd.DataFrame([asdict(r) for r in results]).to_csv("canslim_results.csv", index=False)
-    pd.DataFrame(failed, columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
-
-    print("Saved canslim_results.csv")
-    print("Saved canslim_failures.csv")
+    tg(msg)
+    ai = review(results, market_note, run_label)
+    aimsg = build_ai_message(ai, run_label)
+    if aimsg:
+        print(aimsg)
+        tg(aimsg, parse_mode=None)
+    save_outputs(results, failed, ai)
 
 
 if __name__ == "__main__":
