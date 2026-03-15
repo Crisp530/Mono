@@ -27,19 +27,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 MIN_PASS_COUNT = int(os.getenv("MIN_PASS_COUNT", "5"))
 
-# CANSLIM-like thresholds
-MIN_Q_GROWTH = float(os.getenv("MIN_Q_GROWTH", "0.20"))                 # C
-MIN_3Y_CAGR = float(os.getenv("MIN_3Y_CAGR", "0.15"))                   # A
-NEAR_HIGH_RATIO = float(os.getenv("NEAR_HIGH_RATIO", "0.95"))           # N
-MIN_RS_PERCENTILE = float(os.getenv("MIN_RS_PERCENTILE", "80"))         # L
-MIN_INST_OWNERSHIP = float(os.getenv("MIN_INST_OWNERSHIP", "0.35"))     # I
-MIN_VOLUME_SURGE = float(os.getenv("MIN_VOLUME_SURGE", "1.30"))         # S
+# Formal CANSLIM-like thresholds
+MIN_Q_GROWTH = float(os.getenv("MIN_Q_GROWTH", "0.20"))
+MIN_3Y_CAGR = float(os.getenv("MIN_3Y_CAGR", "0.15"))
+NEAR_HIGH_RATIO = float(os.getenv("NEAR_HIGH_RATIO", "0.95"))
+MIN_RS_PERCENTILE = float(os.getenv("MIN_RS_PERCENTILE", "80"))
+MIN_INST_OWNERSHIP = float(os.getenv("MIN_INST_OWNERSHIP", "0.35"))
+MIN_VOLUME_SURGE = float(os.getenv("MIN_VOLUME_SURGE", "1.30"))
 MIN_DOLLAR_VOLUME_20D = float(os.getenv("MIN_DOLLAR_VOLUME_20D", "20000000"))
+
+# Broad pre-screen thresholds (intentionally looser)
+PRE_NEAR_HIGH_RATIO = float(os.getenv("PRE_NEAR_HIGH_RATIO", "0.90"))
+PRE_MIN_RS_PERCENTILE = float(os.getenv("PRE_MIN_RS_PERCENTILE", "60"))
+PRE_MIN_DOLLAR_VOLUME_20D = float(os.getenv("PRE_MIN_DOLLAR_VOLUME_20D", "10000000"))
 
 BENCHMARK = os.getenv("BENCHMARK", "SPY")
 MARKET_ETFS = ["SPY", "QQQ"]
 
-REQUEST_PAUSE = float(os.getenv("REQUEST_PAUSE", "0.2"))
+REQUEST_PAUSE = float(os.getenv("REQUEST_PAUSE", "0.1"))
 MAX_MESSAGE_STOCKS = int(os.getenv("MAX_MESSAGE_STOCKS", "20"))
 
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
@@ -68,9 +73,8 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
 def get_sp500_tickers() -> List[str]:
     """
     Read current S&P 500 constituents from Wikipedia.
-    Notes:
-    - Wikipedia table usually contains ~503 symbols because some companies have multiple share classes.
-    - Yahoo Finance tickers use '-' instead of '.' for share-class symbols, e.g. BRK.B -> BRK-B
+    Yahoo Finance uses '-' instead of '.' in share-class symbols.
+    Example: BRK.B -> BRK-B
     """
     tables = pd.read_html(SP500_WIKI_URL)
     if not tables:
@@ -85,7 +89,7 @@ def get_sp500_tickers() -> List[str]:
         .astype(str)
         .str.strip()
         .str.upper()
-        .str.replace(".", "-", regex=False)   # Yahoo format: BRK.B -> BRK-B
+        .str.replace(".", "-", regex=False)
         .tolist()
     )
 
@@ -118,12 +122,10 @@ def calc_cagr(values: List[float]) -> Optional[float]:
     vals = [v for v in values if v is not None and pd.notna(v)]
     if len(vals) < 2:
         return None
-
     first, last = vals[0], vals[-1]
     n = len(vals) - 1
     if first <= 0 or last <= 0 or n <= 0:
         return None
-
     return (last / first) ** (1 / n) - 1
 
 
@@ -145,10 +147,8 @@ def get_history(symbol: str, period: str = "2y", interval: str = "1d") -> Option
         )
         if df is None or df.empty:
             return None
-
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
-
         return df.dropna(how="all")
     except Exception:
         return None
@@ -178,18 +178,14 @@ def get_quarterly_net_income_or_eps(ticker: yf.Ticker) -> Tuple[Optional[float],
         q_is = ticker.quarterly_income_stmt
         if q_is is not None and not q_is.empty:
             idx_lower = [str(i).lower() for i in q_is.index]
-            candidates = ["net income", "netincome", "normalized income"]
-            row_name = None
-            for c in candidates:
+            for c in ["net income", "netincome", "normalized income"]:
                 if c in idx_lower:
                     row_name = q_is.index[idx_lower.index(c)]
-                    break
-            if row_name is not None:
-                row = q_is.loc[row_name]
-                vals = [safe_float(v) for v in row.tolist()]
-                vals = [v for v in vals if v is not None]
-                if len(vals) >= 5:
-                    return vals[0], vals[4], "quarterly_net_income"
+                    row = q_is.loc[row_name]
+                    vals = [safe_float(v) for v in row.tolist()]
+                    vals = [v for v in vals if v is not None]
+                    if len(vals) >= 5:
+                        return vals[0], vals[4], "quarterly_net_income"
     except Exception:
         pass
 
@@ -213,19 +209,14 @@ def get_annual_eps_or_net_income_series(ticker: yf.Ticker) -> Tuple[List[float],
         a_is = ticker.income_stmt
         if a_is is not None and not a_is.empty:
             idx_lower = [str(i).lower() for i in a_is.index]
-            candidates = ["net income", "netincome", "normalized income"]
-            row_name = None
-            for c in candidates:
+            for c in ["net income", "netincome", "normalized income"]:
                 if c in idx_lower:
                     row_name = a_is.index[idx_lower.index(c)]
-                    break
-            if row_name is not None:
-                row = a_is.loc[row_name]
-                vals = [safe_float(v) for v in row.tolist()]
-                vals = [v for v in vals if v is not None]
-                if len(vals) >= 3:
-                    vals = list(reversed(vals))
-                    return vals, "annual_net_income"
+                    row = a_is.loc[row_name]
+                    vals = [safe_float(v) for v in row.tolist()]
+                    vals = [v for v in vals if v is not None]
+                    if len(vals) >= 3:
+                        return list(reversed(vals)), "annual_net_income"
     except Exception:
         pass
 
@@ -245,7 +236,6 @@ class ScreenResult:
     i_inst: Optional[bool]
     s_volume: Optional[bool]
     market_ok: Optional[bool]
-
     current_growth_value: Optional[float] = None
     cagr_3y_value: Optional[float] = None
     rs_percentile: Optional[float] = None
@@ -277,11 +267,7 @@ def market_trend_is_bullish() -> Tuple[bool, str]:
         ma50 = compute_ma(close, 50)
         ma200 = compute_ma(close, 200)
 
-        if symbol == "SPY":
-            cond = (last > ma50) and (ma50 > ma200)
-        else:
-            cond = (last > ma200)
-
+        cond = (last > ma50) and (ma50 > ma200) if symbol == "SPY" else (last > ma200)
         notes.append(f"{symbol} last={last:.2f}, ma50={ma50:.2f}, ma200={ma200:.2f}, bull={cond}")
         ok = ok and cond
 
@@ -315,10 +301,8 @@ def compute_relative_strength_percentiles(
             continue
 
         try:
-            ret_6m = float(close.iloc[-1] / close.iloc[-126] - 1)
-            ret_12m = float(close.iloc[-1] / close.iloc[0] - 1)
-            rets_6m[symbol] = ret_6m
-            rets_12m[symbol] = ret_12m
+            rets_6m[symbol] = float(close.iloc[-1] / close.iloc[-126] - 1)
+            rets_12m[symbol] = float(close.iloc[-1] / close.iloc[0] - 1)
         except Exception:
             continue
 
@@ -328,19 +312,62 @@ def compute_relative_strength_percentiles(
     series_6m = pd.Series(rets_6m)
     percentiles = series_6m.rank(pct=True) * 100
 
-    result = {}
-    for symbol in series_6m.index:
-        result[symbol] = {
+    return {
+        symbol: {
             "rs_percentile": float(percentiles.loc[symbol]),
             "ret_12m": float(rets_12m.get(symbol, np.nan)),
             "benchmark_12m": benchmark_12m if benchmark_12m is not None else np.nan,
         }
-
-    return result
+        for symbol in series_6m.index
+    }
 
 
 # =========================
-# SINGLE STOCK SCREEN
+# PRE-SCREEN
+# =========================
+def pre_screen_by_price_and_volume(tickers: List[str], rs_map: Dict[str, Dict[str, float]]) -> List[str]:
+    """
+    Wide filter only.
+    Purpose: remove clearly unqualified names before expensive fundamental lookups.
+    """
+    candidates = []
+
+    for symbol in tickers:
+        hist = get_history(symbol, period="1y")
+        time.sleep(REQUEST_PAUSE)
+        if hist is None or hist.empty:
+            continue
+
+        close = hist["Close"].dropna()
+        volume = hist["Volume"].dropna()
+
+        if len(close) < 200 or len(volume) < 20:
+            continue
+
+        last_price = float(close.iloc[-1])
+        high_52w = float(close.max())
+        ma200 = compute_ma(close, 200)
+
+        dv20 = (hist["Close"] * hist["Volume"]).tail(20)
+        avg_dollar_volume_20d = float(dv20.mean()) if len(dv20) >= 20 else None
+
+        rs_percentile = safe_float(rs_map.get(symbol, {}).get("rs_percentile"))
+
+        cond_near_high = last_price >= PRE_NEAR_HIGH_RATIO * high_52w if high_52w else False
+        cond_trend = (ma200 is not None) and (last_price > ma200)
+        cond_liquidity = (avg_dollar_volume_20d is not None) and (avg_dollar_volume_20d >= PRE_MIN_DOLLAR_VOLUME_20D)
+        cond_rs = (rs_percentile is not None) and (rs_percentile >= PRE_MIN_RS_PERCENTILE)
+
+        # broad filter: 3 of 4
+        score = sum([cond_near_high, cond_trend, cond_liquidity, cond_rs])
+        if score >= 3:
+            candidates.append(symbol)
+
+    return candidates
+
+
+# =========================
+# FULL SCREEN
 # =========================
 def screen_stock(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bool) -> ScreenResult:
     notes = []
@@ -375,27 +402,23 @@ def screen_stock(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bo
     avg_vol_50 = float(volume.tail(50).mean()) if len(volume) >= 50 else None
     latest_vol = float(volume.iloc[-1]) if len(volume) > 0 else None
 
-    avg_dollar_volume_20d = None
-    try:
-        dv20 = (hist["Close"] * hist["Volume"]).tail(20)
-        if len(dv20) >= 20:
-            avg_dollar_volume_20d = float(dv20.mean())
-    except Exception:
-        pass
+    dv20 = (hist["Close"] * hist["Volume"]).tail(20)
+    avg_dollar_volume_20d = float(dv20.mean()) if len(dv20) >= 20 else None
 
+    # C
     latest_q, year_ago_q, c_field = get_quarterly_net_income_or_eps(ticker)
     current_growth_value = pct_change(latest_q, year_ago_q)
     c_current_growth = None if current_growth_value is None else (current_growth_value >= MIN_Q_GROWTH)
     notes.append(f"C source={c_field}")
 
+    # A
     annual_series, a_field = get_annual_eps_or_net_income_series(ticker)
     cagr_3y_value = None
     a_cagr_3y = None
     a_recent_positive = None
 
     if len(annual_series) >= 4:
-        last4 = annual_series[-4:]
-        cagr_3y_value = calc_cagr(last4)
+        cagr_3y_value = calc_cagr(annual_series[-4:])
         a_cagr_3y = None if cagr_3y_value is None else (cagr_3y_value >= MIN_3Y_CAGR)
     elif len(annual_series) >= 3:
         cagr_3y_value = calc_cagr(annual_series)
@@ -406,11 +429,11 @@ def screen_stock(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bo
 
     notes.append(f"A source={a_field}")
 
+    # N
     n_near_high = (last_price >= NEAR_HIGH_RATIO * high_52w) if high_52w else None
-    n_trend = None
-    if ma50 is not None and ma200 is not None:
-        n_trend = (last_price > ma50) and (ma50 > ma200)
+    n_trend = None if (ma50 is None or ma200 is None) else ((last_price > ma50) and (ma50 > ma200))
 
+    # L
     rs_percentile = None
     l_rs = None
     if symbol in rs_map:
@@ -420,14 +443,16 @@ def screen_stock(symbol: str, rs_map: Dict[str, Dict[str, float]], market_ok: bo
         if rs_percentile is not None and stock_12m is not None and bench_12m is not None:
             l_rs = (rs_percentile >= MIN_RS_PERCENTILE) and (stock_12m > bench_12m)
 
+    # I
     inst = safe_float(info.get("heldPercentInstitutions"))
     i_inst = None if inst is None else (inst >= MIN_INST_OWNERSHIP)
 
+    # S
     volume_ratio = None
     s_volume = None
     if latest_vol is not None and avg_vol_50 is not None and avg_vol_50 > 0:
         volume_ratio = latest_vol / avg_vol_50
-        liquid_enough = (avg_dollar_volume_20d is not None and avg_dollar_volume_20d >= MIN_DOLLAR_VOLUME_20D)
+        liquid_enough = (avg_dollar_volume_20d is not None) and (avg_dollar_volume_20d >= MIN_DOLLAR_VOLUME_20D)
         s_volume = (volume_ratio >= MIN_VOLUME_SURGE) and liquid_enough
 
     checks = [
@@ -499,12 +524,19 @@ def fmt_num(v: Optional[float], ndigits: int = 2) -> str:
     return f"{v:.{ndigits}f}"
 
 
-def build_message(results: List[ScreenResult], market_note: str, run_label: str, universe_size: int) -> str:
+def build_message(
+    results: List[ScreenResult],
+    market_note: str,
+    run_label: str,
+    universe_size: int,
+    candidate_size: int,
+) -> str:
     if not results:
         return (
             f"*Modern CANSLIM Screen*\n\n"
             f"Run time: `{run_label}`\n"
             f"Universe: S&P 500 constituents ({universe_size} tickers)\n"
+            f"Pre-screen candidates: {candidate_size}\n"
             f"Market trend: ✅\n"
             f"{market_note}\n\n"
             f"No stocks passed this run."
@@ -515,6 +547,7 @@ def build_message(results: List[ScreenResult], market_note: str, run_label: str,
         "",
         f"Run time: `{run_label}`",
         f"Universe: S&P 500 constituents ({universe_size} tickers)",
+        f"Pre-screen candidates: {candidate_size}",
         "Market trend: ✅",
         market_note,
         "",
@@ -580,11 +613,15 @@ def main():
     print("Computing relative strength map...")
     rs_map = compute_relative_strength_percentiles(tickers, BENCHMARK)
 
+    print("Running broad pre-screen...")
+    candidates = pre_screen_by_price_and_volume(tickers, rs_map)
+    print(f"Pre-screen kept {len(candidates)} / {len(tickers)}")
+
     results: List[ScreenResult] = []
     failed: List[Tuple[str, str]] = []
 
-    for i, symbol in enumerate(tickers, 1):
-        print(f"[{i}/{len(tickers)}] Screening {symbol}")
+    for i, symbol in enumerate(candidates, 1):
+        print(f"[{i}/{len(candidates)}] Screening {symbol}")
         try:
             result = screen_stock(symbol, rs_map, market_ok)
             if result.pass_count >= MIN_PASS_COUNT:
@@ -603,18 +640,13 @@ def main():
         reverse=True,
     )
 
-    msg = build_message(results, market_note, run_label, len(tickers))
+    msg = build_message(results, market_note, run_label, len(tickers), len(candidates))
     print(msg)
     send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
 
-    out = pd.DataFrame([asdict(r) for r in results])
-    out.to_csv("canslim_results.csv", index=False)
-    print("Saved to canslim_results.csv")
-
+    pd.DataFrame([asdict(r) for r in results]).to_csv("canslim_results.csv", index=False)
     if failed:
-        fail_df = pd.DataFrame(failed, columns=["symbol", "error"])
-        fail_df.to_csv("canslim_failures.csv", index=False)
-        print("Saved to canslim_failures.csv")
+        pd.DataFrame(failed, columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
 
 
 if __name__ == "__main__":
