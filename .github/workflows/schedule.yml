@@ -27,14 +27,23 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          AI_ENABLED: ${{ vars.AI_ENABLED }}
+          AI_REVIEW_MAX_STOCKS: ${{ vars.AI_REVIEW_MAX_STOCKS }}
+          AI_TIMEOUT: ${{ vars.AI_TIMEOUT }}
+          AI_TEMPERATURE: ${{ vars.AI_TEMPERATURE }}
+          AI_MAX_OUTPUT_TOKENS: ${{ vars.AI_MAX_OUTPUT_TOKENS }}
         run: |
-          python canslim_us_telegram.py
+          python monthly_canslim_ai.py
 
-      - name: Upload results CSV
+      - name: Upload results files
         uses: actions/upload-artifact@v4
         with:
           name: canslim-results
           path: |
             canslim_results.csv
             canslim_failures.csv
+            canslim_ai_review.json
+            canslim_ai_reviews.csv
           if-no-files-found: ignore
