@@ -5,6 +5,7 @@ import requests
 import warnings
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+from io import StringIO
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -36,7 +37,7 @@ MIN_INST_OWNERSHIP = float(os.getenv("MIN_INST_OWNERSHIP", "0.35"))
 MIN_VOLUME_SURGE = float(os.getenv("MIN_VOLUME_SURGE", "1.30"))
 MIN_DOLLAR_VOLUME_20D = float(os.getenv("MIN_DOLLAR_VOLUME_20D", "20000000"))
 
-# Broad pre-screen thresholds (intentionally looser)
+# Broad pre-screen thresholds
 PRE_NEAR_HIGH_RATIO = float(os.getenv("PRE_NEAR_HIGH_RATIO", "0.90"))
 PRE_MIN_RS_PERCENTILE = float(os.getenv("PRE_MIN_RS_PERCENTILE", "60"))
 PRE_MIN_DOLLAR_VOLUME_20D = float(os.getenv("PRE_MIN_DOLLAR_VOLUME_20D", "10000000"))
@@ -44,10 +45,20 @@ PRE_MIN_DOLLAR_VOLUME_20D = float(os.getenv("PRE_MIN_DOLLAR_VOLUME_20D", "100000
 BENCHMARK = os.getenv("BENCHMARK", "SPY")
 MARKET_ETFS = ["SPY", "QQQ"]
 
-REQUEST_PAUSE = float(os.getenv("REQUEST_PAUSE", "0.1"))
+REQUEST_PAUSE = float(os.getenv("REQUEST_PAUSE", "0.05"))
 MAX_MESSAGE_STOCKS = int(os.getenv("MAX_MESSAGE_STOCKS", "20"))
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "30"))
 
 SP500_WIKI_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+SP500_FALLBACK_CSV_URL = "https://datahub.io/core/s-and-p-500-companies/r/constituents.csv"
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
 
 
 # =========================
@@ -66,38 +77,74 @@ def send_telegram_message(token: str, chat_id: str, text: str) -> None:
         "parse_mode": "Markdown",
         "disable_web_page_preview": True,
     }
-    r = requests.post(url, json=payload, timeout=20)
+    r = requests.post(url, json=payload, timeout=HTTP_TIMEOUT)
     r.raise_for_status()
 
 
-def get_sp500_tickers() -> List[str]:
-    """
-    Read current S&P 500 constituents from Wikipedia.
-    Yahoo Finance uses '-' instead of '.' in share-class symbols.
-    Example: BRK.B -> BRK-B
-    """
-    tables = pd.read_html(SP500_WIKI_URL)
+def safe_get(url: str, headers: Optional[dict] = None, timeout: int = HTTP_TIMEOUT) -> requests.Response:
+    merged_headers = dict(DEFAULT_HEADERS)
+    if headers:
+        merged_headers.update(headers)
+    resp = requests.get(url, headers=merged_headers, timeout=timeout)
+    resp.raise_for_status()
+    return resp
+
+
+def normalize_tickers(tickers: List[str]) -> List[str]:
+    cleaned = []
+    for x in tickers:
+        s = str(x).strip().upper()
+        if not s:
+            continue
+        s = s.replace(".", "-")  # Yahoo format
+        cleaned.append(s)
+    return sorted(list(set(cleaned)))
+
+
+def get_sp500_tickers_from_wikipedia() -> List[str]:
+    resp = safe_get(SP500_WIKI_URL)
+    tables = pd.read_html(StringIO(resp.text))
     if not tables:
-        raise ValueError("Failed to read tables from S&P 500 source page.")
+        raise ValueError("Wikipedia returned no tables.")
 
     df = tables[0]
     if "Symbol" not in df.columns:
-        raise ValueError("S&P 500 table missing 'Symbol' column.")
+        raise ValueError("Wikipedia S&P 500 table missing 'Symbol' column.")
 
-    tickers = (
-        df["Symbol"]
-        .astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(".", "-", regex=False)
-        .tolist()
-    )
-
-    tickers = sorted(list(set(tickers)))
+    tickers = normalize_tickers(df["Symbol"].tolist())
     if not tickers:
-        raise ValueError("No S&P 500 tickers parsed from source.")
-
+        raise ValueError("Wikipedia returned empty ticker list.")
     return tickers
+
+
+def get_sp500_tickers_from_fallback_csv() -> List[str]:
+    resp = safe_get(SP500_FALLBACK_CSV_URL)
+    df = pd.read_csv(StringIO(resp.text))
+    if "Symbol" not in df.columns:
+        raise ValueError("Fallback CSV missing 'Symbol' column.")
+
+    tickers = normalize_tickers(df["Symbol"].tolist())
+    if not tickers:
+        raise ValueError("Fallback CSV returned empty ticker list.")
+    return tickers
+
+
+def get_sp500_tickers() -> Tuple[List[str], str]:
+    errors = []
+
+    try:
+        tickers = get_sp500_tickers_from_wikipedia()
+        return tickers, "wikipedia"
+    except Exception as e:
+        errors.append(f"Wikipedia failed: {e}")
+
+    try:
+        tickers = get_sp500_tickers_from_fallback_csv()
+        return tickers, "datahub_csv"
+    except Exception as e:
+        errors.append(f"Fallback CSV failed: {e}")
+
+    raise RuntimeError("Unable to load S&P 500 tickers. " + " | ".join(errors))
 
 
 def safe_float(x) -> Optional[float]:
@@ -135,45 +182,59 @@ def compute_ma(series: pd.Series, window: int) -> Optional[float]:
     return float(series.rolling(window).mean().iloc[-1])
 
 
-def get_history(symbol: str, period: str = "2y", interval: str = "1d") -> Optional[pd.DataFrame]:
-    try:
-        df = yf.download(
-            symbol,
-            period=period,
-            interval=interval,
-            auto_adjust=False,
-            progress=False,
-            threads=False,
-        )
-        if df is None or df.empty:
-            return None
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
-        return df.dropna(how="all")
-    except Exception:
-        return None
+def get_history(symbol: str, period: str = "2y", interval: str = "1d", retries: int = 2) -> Optional[pd.DataFrame]:
+    last_error = None
+    for _ in range(retries + 1):
+        try:
+            df = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+            )
+            if df is None or df.empty:
+                return None
+
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            df = df.dropna(how="all")
+            if df.empty:
+                return None
+
+            return df
+        except Exception as e:
+            last_error = e
+            time.sleep(0.5)
+    return None
 
 
 def get_info(ticker: yf.Ticker) -> Dict:
     try:
-        return ticker.info or {}
+        info = ticker.info
+        return info if isinstance(info, dict) else {}
     except Exception:
         return {}
 
 
 def get_quarterly_net_income_or_eps(ticker: yf.Ticker) -> Tuple[Optional[float], Optional[float], str]:
+    # Try quarterly earnings
     try:
         qearn = getattr(ticker, "quarterly_earnings", None)
         if qearn is not None and not qearn.empty:
             cols = [str(c).lower() for c in qearn.columns]
             if "earnings" in cols:
                 col = qearn.columns[cols.index("earnings")]
-                vals = qearn[col].dropna().tolist()
+                vals = [safe_float(v) for v in qearn[col].dropna().tolist()]
+                vals = [v for v in vals if v is not None]
                 if len(vals) >= 5:
-                    return safe_float(vals[-1]), safe_float(vals[-5]), "quarterly_earnings"
+                    return vals[-1], vals[-5], "quarterly_earnings"
     except Exception:
         pass
 
+    # Try quarterly income statement
     try:
         q_is = ticker.quarterly_income_stmt
         if q_is is not None and not q_is.empty:
@@ -193,6 +254,7 @@ def get_quarterly_net_income_or_eps(ticker: yf.Ticker) -> Tuple[Optional[float],
 
 
 def get_annual_eps_or_net_income_series(ticker: yf.Ticker) -> Tuple[List[float], str]:
+    # Try annual earnings
     try:
         earnings = getattr(ticker, "earnings", None)
         if earnings is not None and not earnings.empty:
@@ -200,11 +262,13 @@ def get_annual_eps_or_net_income_series(ticker: yf.Ticker) -> Tuple[List[float],
             if "earnings" in cols:
                 col = earnings.columns[cols.index("earnings")]
                 vals = [safe_float(v) for v in earnings[col].dropna().tolist()]
+                vals = [v for v in vals if v is not None]
                 if len(vals) >= 3:
                     return vals, "annual_earnings"
     except Exception:
         pass
 
+    # Try annual income statement
     try:
         a_is = ticker.income_stmt
         if a_is is not None and not a_is.empty:
@@ -267,6 +331,9 @@ def market_trend_is_bullish() -> Tuple[bool, str]:
         ma50 = compute_ma(close, 50)
         ma200 = compute_ma(close, 200)
 
+        if ma50 is None or ma200 is None:
+            return False, f"{symbol}: moving averages unavailable"
+
         cond = (last > ma50) and (ma50 > ma200) if symbol == "SPY" else (last > ma200)
         notes.append(f"{symbol} last={last:.2f}, ma50={ma50:.2f}, ma200={ma200:.2f}, bull={cond}")
         ok = ok and cond
@@ -312,24 +379,20 @@ def compute_relative_strength_percentiles(
     series_6m = pd.Series(rets_6m)
     percentiles = series_6m.rank(pct=True) * 100
 
-    return {
-        symbol: {
+    result = {}
+    for symbol in series_6m.index:
+        result[symbol] = {
             "rs_percentile": float(percentiles.loc[symbol]),
             "ret_12m": float(rets_12m.get(symbol, np.nan)),
             "benchmark_12m": benchmark_12m if benchmark_12m is not None else np.nan,
         }
-        for symbol in series_6m.index
-    }
+    return result
 
 
 # =========================
 # PRE-SCREEN
 # =========================
 def pre_screen_by_price_and_volume(tickers: List[str], rs_map: Dict[str, Dict[str, float]]) -> List[str]:
-    """
-    Wide filter only.
-    Purpose: remove clearly unqualified names before expensive fundamental lookups.
-    """
     candidates = []
 
     for symbol in tickers:
@@ -358,7 +421,6 @@ def pre_screen_by_price_and_volume(tickers: List[str], rs_map: Dict[str, Dict[st
         cond_liquidity = (avg_dollar_volume_20d is not None) and (avg_dollar_volume_20d >= PRE_MIN_DOLLAR_VOLUME_20D)
         cond_rs = (rs_percentile is not None) and (rs_percentile >= PRE_MIN_RS_PERCENTILE)
 
-        # broad filter: 3 of 4
         score = sum([cond_near_high, cond_trend, cond_liquidity, cond_rs])
         if score >= 3:
             candidates.append(symbol)
@@ -530,12 +592,13 @@ def build_message(
     run_label: str,
     universe_size: int,
     candidate_size: int,
+    ticker_source: str,
 ) -> str:
     if not results:
         return (
             f"*Modern CANSLIM Screen*\n\n"
             f"Run time: `{run_label}`\n"
-            f"Universe: S&P 500 constituents ({universe_size} tickers)\n"
+            f"Universe: S&P 500 ({universe_size} tickers, source: {ticker_source})\n"
             f"Pre-screen candidates: {candidate_size}\n"
             f"Market trend: ✅\n"
             f"{market_note}\n\n"
@@ -546,7 +609,7 @@ def build_message(
         "*Modern CANSLIM Screen*",
         "",
         f"Run time: `{run_label}`",
-        f"Universe: S&P 500 constituents ({universe_size} tickers)",
+        f"Universe: S&P 500 ({universe_size} tickers, source: {ticker_source})",
         f"Pre-screen candidates: {candidate_size}",
         "Market trend: ✅",
         market_note,
@@ -589,8 +652,8 @@ def main():
     print(f"Run time UTC: {now_utc.strftime('%Y-%m-%d %H:%M:%S %Z')}")
     print(f"Run label: {run_label}")
 
-    tickers = get_sp500_tickers()
-    print(f"Loaded {len(tickers)} S&P 500 tickers")
+    tickers, ticker_source = get_sp500_tickers()
+    print(f"Loaded {len(tickers)} S&P 500 tickers from {ticker_source}")
 
     market_ok, market_note = market_trend_is_bullish()
     print(f"Market trend ok: {market_ok}")
@@ -600,7 +663,7 @@ def main():
         msg = (
             f"*Modern CANSLIM Screen*\n\n"
             f"Run time: `{run_label}`\n"
-            f"Universe: S&P 500 constituents ({len(tickers)} tickers)\n"
+            f"Universe: S&P 500 ({len(tickers)} tickers, source: {ticker_source})\n"
             f"Market trend: ❌\n"
             f"{market_note}\n\n"
             f"No signals sent because market filter is not bullish."
@@ -608,6 +671,7 @@ def main():
         print(msg)
         send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
         pd.DataFrame(columns=["symbol"]).to_csv("canslim_results.csv", index=False)
+        pd.DataFrame(columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
         return
 
     print("Computing relative strength map...")
@@ -640,13 +704,15 @@ def main():
         reverse=True,
     )
 
-    msg = build_message(results, market_note, run_label, len(tickers), len(candidates))
+    msg = build_message(results, market_note, run_label, len(tickers), len(candidates), ticker_source)
     print(msg)
     send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, msg)
 
     pd.DataFrame([asdict(r) for r in results]).to_csv("canslim_results.csv", index=False)
-    if failed:
-        pd.DataFrame(failed, columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
+    pd.DataFrame(failed, columns=["symbol", "error"]).to_csv("canslim_failures.csv", index=False)
+
+    print("Saved canslim_results.csv")
+    print("Saved canslim_failures.csv")
 
 
 if __name__ == "__main__":
